@@ -44,7 +44,8 @@ using namespace std;
 class ProblemPack
 {
 public:
-    ProblemPack( AProblemPack pack, size_t companyIndex ) : innerProblemPack( std::move( pack ) ), companyIndex( companyIndex ), leftToSolve( innerProblemPack->m_Problems.size() ) { };
+    ProblemPack( AProblemPack pack, size_t companyIndex )
+    : innerProblemPack( std::move( pack ) ), companyIndex( companyIndex ), leftToSolve( innerProblemPack ? innerProblemPack->m_Problems.size() : SIZE_MAX  ) { };
 
     void problemSolved( void ) { --leftToSolve; }
 
@@ -69,11 +70,11 @@ class Problem
 public:
     Problem(AProblem problem, shared_ptr<ProblemPack> pack) : innerProblem( std::move( problem ) ), originatingPack( std::move( pack ) ) {}
 
-    AProblem& getInnerProblem() {
+    AProblem& getInnerProblem( void ) {
         return innerProblem;
     }
 
-    shared_ptr<ProblemPack>& getOriginatingPack() {
+    shared_ptr<ProblemPack>& getOriginatingPack( void ) {
         return originatingPack;
     }
 
@@ -87,9 +88,6 @@ private:
 class CommunicationBuffer
 {
 public:
-    // Default constructor -> initializes assigns mutex to the inner lock and unlocks it
-    CommunicationBuffer() : innerLock( innerMutex ) { innerLock.unlock(); }
-
     // Adds new problem pack into the queue and notifies one waiting worker thread in case queue was empty
     void addAndNotify( shared_ptr<ProblemPack>& newPack ) {
         bool bufferWasEmpty = this->empty();
@@ -105,19 +103,19 @@ public:
 
     void notifyOneWorker( void ) { innerConditionVariable.notify_one(); }
 
-    void lock( void ) { innerLock.lock(); }
-
-    void unlock( void ) { innerLock.unlock(); }
+    unique_lock<mutex> lock( void ) { return unique_lock<mutex>( innerMutex ); }
 
     bool empty( void ) { return innerQueue.empty(); }
 
-    Problem getProblem( void ) { return innerQueue.front(); }
-
-    void pop( void ) { innerQueue.pop(); }
+    Problem getProblem( void ) {
+        auto problem = innerQueue.front();
+        innerQueue.pop();
+        return problem;
+    }
 
     // Waits for packs to be added into the buffer or for the termination state
-    void waitForPacksOrTermination( atomic_int& activeCompanies ) {
-        innerConditionVariable.wait(innerLock, [&] {
+    void waitForPacksOrTermination( atomic_int& activeCompanies, unique_lock<mutex>& lock ) {
+        innerConditionVariable.wait(lock, [&] {
             return !this->empty() || ( !activeCompanies && this->empty() );
         });
     }
@@ -125,7 +123,6 @@ public:
 private:
     queue<Problem> innerQueue;
     mutex innerMutex;
-    unique_lock<mutex> innerLock;
     condition_variable innerConditionVariable;
 };
 
@@ -134,7 +131,7 @@ private:
 class Company
 {
 public:
-    Company(ACompany company, size_t companyIndex) : innerCompany( std::move( company ) ), companyIndex( companyIndex ), innerLock( innerMutex ) { innerLock.unlock(); };
+    Company(ACompany company, size_t companyIndex) : innerCompany( std::move( company ) ), companyIndex( companyIndex ) {};
 
     Company(const Company &company) : innerCompany( company.innerCompany ), companyIndex( company.companyIndex ) { };
 
@@ -153,22 +150,27 @@ public:
 
 private:
     void getNewPacks( CommunicationBuffer& communicationBuffer, atomic_int& activeCompanies, vector<Company>& companies ) {
+        // Get first pack
         auto newPack = make_shared<ProblemPack>( innerCompany->waitForPack(), companyIndex );
 
+        // Get all the needed locks (in unlocked state)
+        unique_lock<mutex> communicationBufferLock = communicationBuffer.lock();         communicationBufferLock.unlock();
+        unique_lock<mutex> innerLock( innerMutex );                                                 innerLock.unlock();
+
         // While there is a pack
-        while ( newPack.get() ) {
+        while ( newPack->operator bool() ) {
             // Add it to the inner queue to preserve the ordering
             innerLock.lock();
             innerQueue.push( newPack );
             innerLock.unlock();
 
             // And add it to the communication buffer to transfer pack to worker threads
-            communicationBuffer.lock();
+            communicationBufferLock.lock();
             communicationBuffer.addAndNotify( newPack );
-            communicationBuffer.unlock();
+            communicationBufferLock.unlock();
 
             // Get new pack
-            newPack = make_shared<ProblemPack>(innerCompany->waitForPack(), companyIndex);
+            newPack = make_shared<ProblemPack>( innerCompany->waitForPack(), companyIndex );
         }
 
         // All packs are out -> terminate the thread
@@ -180,18 +182,18 @@ private:
     }
 
     void sendSolvedPacks( atomic_int& activeCompanies ) {
-        innerLock.lock();
+        unique_lock<mutex> innerLock( innerMutex );
 
         while ( true ) {
             // Wait for the front problem pack to be solved or for the termination state
-            waitForSolvedPacksOrTermination( activeCompanies );
+            waitForSolvedPacksOrTermination( activeCompanies, innerLock );
 
             // Termination stage check
             if ( !activeCompanies && innerQueue.empty() )
                 break;
 
             // Front problem pack is solved -> send it back to the company
-            sendBackFrontPack();
+            sendBackFrontPack( innerLock );
         }
 
         // Termination stage (just for the sake of perfectionism)
@@ -203,13 +205,13 @@ private:
             company.notify();
     }
 
-    void waitForSolvedPacksOrTermination( atomic_int& activeCompanies ) {
+    void waitForSolvedPacksOrTermination( atomic_int& activeCompanies, unique_lock<mutex>& innerLock ) {
         innerConditionVariable.wait(innerLock, [&] {
             return (!innerQueue.empty() && innerQueue.front()->isSolved()) || (!activeCompanies && innerQueue.empty());
         });
     }
 
-    void sendBackFrontPack( void ) {
+    void sendBackFrontPack( unique_lock<mutex>& innerLock ) {
         // Get solved pack from the queue
         auto solvedPack = innerQueue.front();
         innerQueue.pop();
@@ -229,7 +231,6 @@ private:
     size_t companyIndex;
     queue<shared_ptr<ProblemPack>> innerQueue;
     mutex innerMutex;
-    unique_lock<mutex> innerLock;
     condition_variable innerConditionVariable;
     thread newPacksReceiver;
     thread solvedPacksSender;
@@ -289,6 +290,9 @@ public:
 
     void start ( int threadCount )
     {
+        // Set active companies count
+        activeCompanies = companies.size();
+
         // Initialize worker threads
         this->initializeWorkerThreads( threadCount );
 
@@ -314,11 +318,11 @@ public:
 
 private:
     void computeAndNotify( void ) {
-        communicationBuffer.lock();
+        unique_lock<mutex> communicationBufferLock = communicationBuffer.lock();
 
         while ( true ) {
             // Wait for some problems to appear in the buffer or for the termination state
-            communicationBuffer.waitForPacksOrTermination( activeCompanies );
+            communicationBuffer.waitForPacksOrTermination( activeCompanies, communicationBufferLock );
 
             // Termination state check
             if ( !activeCompanies && communicationBuffer.empty() )
@@ -334,7 +338,7 @@ private:
                 std::swap(solver, fullSolver);
 
                 // Open the critical region for other worker threads
-                communicationBuffer.unlock();
+                communicationBufferLock.unlock();
 
                 // Notify one worker thread and do the computation
                 communicationBuffer.notifyOneWorker();
@@ -344,7 +348,7 @@ private:
                 fullSolver.notifyCompanies( companies );
 
                 // Lock back the critical region
-                communicationBuffer.lock();
+                communicationBufferLock.lock();
             }
         }
 
@@ -356,8 +360,8 @@ private:
             solver.notifyCompanies( companies );
         }
 
-        // Open the critical region
-        communicationBuffer.unlock();
+        // Open the critical region (done by default, but for the sake of readability)
+        communicationBufferLock.unlock();
     }
 
     void fillTheSolver( void ) {
@@ -368,8 +372,8 @@ private:
 
     void initializeWorkerThreads( int threadCount )
     {
-        for ( auto& workerThread: workerThreads ) {
-            workerThread = thread( &COptimizer::computeAndNotify, this );
+        for ( int index = 0; index < threadCount; ++index ) {
+            workerThreads.emplace_back( &COptimizer::computeAndNotify, this );
         }
     }
 
@@ -392,12 +396,17 @@ private:
 int                                    main                                    ( void )
 {
   COptimizer optimizer;
-  ACompanyTest  company = std::make_shared<CCompanyTest> ();
-  optimizer . addCompany ( company );
-  optimizer . start ( 4 );
+  ACompanyTest  company1 = std::make_shared<CCompanyTest> ();
+  ACompanyTest  company2 = std::make_shared<CCompanyTest> ();
+  optimizer . addCompany ( company1 );
+  optimizer . addCompany ( company2 );
+  optimizer . start ( 7 );
   optimizer . stop  ();
-  if ( ! company -> allProcessed () )
-    throw std::logic_error ( "(some) problems were not correctly processed" );
+  if ( ! company1 -> allProcessed () )
+    throw std::logic_error ( "(some) problems were not correctly processed in company1" );
+  if ( ! company2 -> allProcessed () )
+    throw std::logic_error ( "(some) problems were not correctly processed in company2" );
+  printf("Aboba\n");
   return 0;  
 }
 #endif /* __PROGTEST__ */ 
